@@ -51,6 +51,6 @@ class SMBAuthTests(unittest.TestCase):
             root=Path(folder);native=fixture(root)
             before=(native/'progress.sqlite').read_bytes()
             dataset,subjects=subjects_in(root)
-            self.assertEqual(dataset,native)
+            self.assertEqual(dataset,native.resolve()) # Windows 8.3 TEMP aliases resolve to the same directory.
             self.assertEqual(subjects,['s001','s002'])
             self.assertEqual(before,(native/'progress.sqlite').read_bytes())
