@@ -1,5 +1,7 @@
 # 多台电脑分发与 NAS 使用（内网加速版）
 
+2026-11-15 更新：本版自动同步 NAS 已上传进度，完成当前默认 10 次目标后可提高次数；采集结束保存后自动上传并校验。所有换机采集电脑应使用同一更新版，旧版不会遵守 NAS 被试占用保护。详情与升级注意事项见 [跨电脑续采](cross-pc-progress.md)。
+
 内网加速版分发仓库：`https://github.com/DiDicpR/cfimage-brainco-acquisition-lan`。使用独立目录 `D:\Paradigm-update\cfimage-brainco-acquisition-lan`，保留首版目录。新目录不会自动继承旧目录中的被试数据；已有采集需要续采时，应先迁移完整数据和本机配置，再检查剩余进度。
 
 ## 操作顺序

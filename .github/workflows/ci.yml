@@ -27,7 +27,7 @@ jobs:
       # Source-only checkout: uv sync installs third-party dependencies only.
       - run: uv sync --locked --python ${{ matrix.python }}
       - run: uv pip check
-      - run: uv run --no-sync python -m unittest discover -s tests -v
+      - run: uv run --no-sync python -m pytest -q
       - run: uv run --no-sync python -m unittest discover -s vendor/brainco_standalone/tests -v
       - run: uv run --no-sync python main.py --validate
       - run: uv run --no-sync python -m src --validate

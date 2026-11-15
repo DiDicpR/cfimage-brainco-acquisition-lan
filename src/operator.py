@@ -130,7 +130,7 @@ def launch_operator_config(experiment: dict, devices: dict, *, continue_collecti
     dialog = OperatorDialog(experiment, devices, modes, preflight_device)
     if continue_collection:
         QTimer.singleShot(0, lambda: dialog.begin_check(True))
-    elif experiment.get('fixed_schedule') and dialog.participant.text().strip():
+    elif experiment.get('fixed_schedule') and not experiment.get('nas_progress_sync') and dialog.participant.text().strip():
         QTimer.singleShot(0, lambda: dialog.begin_check(False, progress_only=True))
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return 1

@@ -242,6 +242,20 @@ class SessionRunner(QObject):
             import shutil
             shutil.copyfile(self.experiment['fixed_schedule']['path'],
                             self.store.session_dir / 'fixed_schedule.csv')
+            if self.run_mode == 'brainco' and self.experiment['collection']['target_repetitions'] > 10:
+                import csv, json, hashlib
+                from .fixed_schedule import read_schedule, EXTENSION_VERSION
+                effective = self.store.session_dir / 'fixed_schedule.csv'
+                shutil.copyfile(effective, self.store.session_dir / 'fixed_schedule_base.csv')
+                rows = read_schedule(self.experiment, stimuli, self.scene_metadata)
+                with effective.open('w', encoding='utf-8-sig', newline='') as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                    writer.writeheader(); writer.writerows(rows)
+                (self.store.session_dir / 'schedule-provenance.json').write_text(json.dumps(dict(
+                    base_schedule_sha256=self.experiment['fixed_schedule']['sha256'],
+                    effective_schedule_sha256=hashlib.sha256(effective.read_bytes()).hexdigest(),
+                    extension_version=EXTENSION_VERSION,
+                    target_repetitions=self.experiment['collection']['target_repetitions']), indent=2), encoding='utf-8')
         if collection_context:
             import json
             (self.store.session_dir / 'collection.json').write_text(
@@ -1128,7 +1142,11 @@ def run_session(experiment: dict[str, Any], devices: dict[str, Any], **kwargs: A
     lock.setStaleLockTime(0)
     if not lock.tryLock(0):
         raise RuntimeError('已有实验正在使用该数据库，请先结束并保存原实验，不能同时续采。')
+    nas_reservation=None
     try:
+        if kwargs.get('run_mode')=='brainco' and experiment.get('nas_progress_sync'):
+            from ..subject_sync import begin_synced_acquisition
+            nas_reservation=begin_synced_acquisition(experiment,str(kwargs['participant_id']))
         with acquisition_lock(str(kwargs.get("run_mode", "simulation")), devices):
             try:
                 return _run_session_locked(experiment, devices, **kwargs)
@@ -1137,7 +1155,17 @@ def run_session(experiment: dict[str, Any], devices: dict[str, Any], **kwargs: A
                 if disconnect is not None:
                     disconnect()
     finally:
-        lock.unlock()
+        needs_upload=False
+        try:
+            if nas_reservation:
+                from ..subject_sync import end_synced_acquisition
+                needs_upload=end_synced_acquisition(nas_reservation)
+        finally:lock.unlock()
+        if needs_upload:
+            # The stream, SQLite writer, device lease and local acquisition lock
+            # are all closed before taking a consistent upload snapshot.
+            from ..transfer_ui import auto_upload_after_session
+            auto_upload_after_session(experiment,str(kwargs['participant_id']))
 
 
 def _run_session_locked(

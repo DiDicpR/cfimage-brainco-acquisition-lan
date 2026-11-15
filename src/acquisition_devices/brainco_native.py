@@ -35,7 +35,8 @@ class NativeAudit:
     """Verify closed, saved samples and marker rows; never use mere file existence."""
     def __init__(self, path):
         self.path = Path(path)
-        with closing(sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+        from ..nas_transfer import readonly_sqlite_uri
+        with closing(sqlite3.connect(readonly_sqlite_uri(self.path),uri=True)) as db:
             state = db.execute("SELECT value FROM metadata WHERE key='state'").fetchone()
             if not state or json.loads(state[0]).get('status') != 'closed':
                 raise ValueError('BrainCo 连续文件未正常关闭')

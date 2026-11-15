@@ -10,6 +10,25 @@ import sqlite3
 
 from .planner import PlannedTrial, SessionPlan, PlanError
 
+EXTENSION_VERSION = 'brainco-append-v1'
+
+
+def append_cycles(rows, repetitions, count=2580):
+    """Stable prefix across target increases and computers; base rows untouched."""
+    result = list(rows)
+    prototypes = {r['image_id']: r for r in rows[:count]}
+    for cycle in range(11, repetitions + 1):
+        ordered = sorted(prototypes, key=lambda image: hashlib.sha256(
+            f'{EXTENSION_VERSION}:{cycle}:{image}'.encode('utf-8')).digest())
+        recent = {r['image_id'] for r in result[-30:]}
+        first = [image for image in ordered if image not in recent][:30]
+        first_set = set(first)
+        ordered = first + [image for image in ordered if image not in first_set]
+        for pos, image in enumerate(ordered, 1):
+            result.append(dict(prototypes[image], trial_id=str((cycle-1)*count+pos),
+                cycle=str(cycle), repeat_index=str(cycle), cycle_position=str(pos)))
+    return result
+
 
 def validate_settings(experiment):
     spec = experiment['fixed_schedule']
@@ -17,11 +36,13 @@ def validate_settings(experiment):
     count = 2580 if brainco else 272
     duration = 600 if brainco else 1200
     repetitions = 10 if brainco else 100
+    requested = experiment['collection']['target_repetitions']
+    valid_target = (type(requested) is int and 10 <= requested <= 100) if brainco else requested == repetitions
     if (int(experiment['stimulus']['image_duration_ms']) != duration
             or int(experiment['stimulus']['isi_ms']) != 100
             or experiment['attention_probe']['enabled']
             or experiment.get('dual_image', {}).get('enabled', False)
-            or experiment['collection']['target_repetitions'] != repetitions
+            or not valid_target
             or experiment['collection']['strategy'] != 'scenes'
             or experiment['blocks']['trials_per_block'] != count
             or experiment['blocks']['minimum_rest_sec'] != 0
@@ -62,6 +83,8 @@ def read_schedule(experiment, stimuli, metadata):
     for start in range(0, len(rows), count):
         if {r['image_id'] for r in rows[start:start + count]} != set(by_id):
             raise ValueError(f'每个 cycle 必须恰好包含 {count} 张图片各一次。')
+    if brainco:
+        rows = append_cycles(rows, experiment['collection']['target_repetitions'], count)
     return rows
 
 
@@ -72,6 +95,12 @@ def resume_progress(database, participant, mode, dataset_root, experiment):
     # not silently replaced to turn 100 presentations into 100 valid EEG epochs.
     progress, rejected = saved_progress(database, participant, mode, dataset_root, by_schedule=True)
     digest = experiment['fixed_schedule']['sha256']
+    if mode=='brainco' and experiment.get('nas_progress_sync'):
+        from ..subject_sync import remote_completed
+        remote=remote_completed(dataset_root,participant,database,digest)
+        # Completion is a set of exact protocol positions, not a sum of repeats
+        # across PCs. Original repeated trials remain unchanged for analysis.
+        progress={key:1 for key in set(progress)|remote}
     if any(key[0] != digest for key in progress):
         raise ValueError('该被试已有不同固定排程的记录，请恢复原方案。')
     if any(count != 1 for count in progress.values()):
@@ -111,11 +140,18 @@ def build_fixed_plan(stimuli, metadata, progress, experiment):
         estimated_minutes=math.ceil(len(trials) * ((experiment['stimulus']['image_duration_ms'] + experiment['stimulus']['isi_ms']) / 1000) / 60), limited_by_image_gap=False,
         schedule_sha256=digest, resume_policy='verified_fixed_schedule_ids',
         next_schedule_trial_id=trials[0].schedule_trial_id if trials else None)
+    if experiment['fixed_schedule'].get('profile') == 'brainco_all_images':
+        summary['extension_version'] = EXTENSION_VERSION
     return plan, summary
 
 
 def preview_fixed(experiment, participant, mode):
     from .scenes import read_scene_catalog
+    registered = 10
+    if mode == 'brainco' and experiment.get('nas_progress_sync'):
+        from ..subject_sync import cached_target
+        registered = cached_target(experiment, participant)
+        experiment['collection']['target_repetitions'] = max(registered, experiment['collection']['target_repetitions'])
     stimuli, metadata = read_scene_catalog(Path(experiment['paths']['stimulus_manifest']).resolve())
     path = Path(experiment['paths']['database']).resolve()
     database = None
@@ -126,6 +162,12 @@ def preview_fixed(experiment, participant, mode):
         progress, rejected = resume_progress(database, participant, mode,
             Path(experiment['paths']['dataset_root']).resolve(), experiment)
         _, summary = build_fixed_plan(stimuli, metadata, progress, experiment)
+        if mode == 'brainco':
+            complete = sum(key[1] <= registered * 2580 for key in progress) == registered * 2580
+            if experiment.get('nas_progress_sync') and experiment['collection']['target_repetitions'] > registered and not complete:
+                raise ValueError(f'请先完成当前每张 {registered} 次的目标，再增加累计次数。')
+            summary.update(registered_target_repetitions=registered, extension_allowed=complete,
+                           extension_version=EXTENSION_VERSION)
         summary['unverified_trials'] = rejected
         return summary
     finally:

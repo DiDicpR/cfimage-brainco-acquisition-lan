@@ -34,3 +34,7 @@
 正常事件序列：`session_start` → 每个试次的 `trial_start` / `trial_end` → `session_end`。异常会记录 `session_failed`，Ctrl+C 记录 `session_interrupted`；设备打开失败时不会产生 `session_start`。设备关闭失败会在日志和 `cleanup_error` 中记录，并将原先成功的会话改为失败。
 
 事件逐条刷新，采样数据在试次结束及会话退出时刷新。崩溃或断电后的完整性仍需核查。
+
+## 跨电脑续采增补（2026-11-15）
+
+原始 EEG 与 events 格式不变。上传清单新增 `resume/verified-progress-v1.json`；扩展 10 次以上的会话另保存基础/实际排程与 `schedule-provenance.json`。字段含义、完成位置与有效 EEG 的区别见 [跨电脑续采与次数扩展](cross-pc-progress.md)。

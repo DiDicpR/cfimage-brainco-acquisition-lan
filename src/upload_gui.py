@@ -52,7 +52,8 @@ class UploadDialog(QDialog):
             QMessageBox.information(self,'没有被试','请先选择有采集数据的文件夹。');return
         try:dataset=find_dataset(self.folder.text())
         except ValueError as e:QMessageBox.warning(self,'数据目录',str(e));return
-        TransferDialog('上传被试：'+participant,lambda progress:upload_subject(dataset,participant,progress=progress),self).exec()
+        from .transfer_ui import upload_with_notice
+        upload_with_notice(dataset,participant,self)
 
 
 def main():

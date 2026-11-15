@@ -1,5 +1,7 @@
 # BrainCo scene EEG acquisition (uv)
 
+2026-11-15：工作台打开后自动同步 NAS 被试列表，选定编号后自动同步进度；每段采集结束并保存后自动上传、读回校验并发布续采进度。默认每张 10 次，完成目标后次数栏解锁，可增加累计次数并跨电脑续采。见 [跨电脑进度与次数扩展](docs/cross-pc-progress.md)。
+
 ## 实验电脑部署（内网加速版）
 
 本版独立分发仓库为 `DiDicpR/cfimage-brainco-acquisition-lan`，目标目录为 `D:\Paradigm-update\cfimage-brainco-acquisition-lan`，与首版目录分开。旧目录中的采集数据和本机配置保留；不要将新空目录当成已经自动迁移了旧版续采进度。

@@ -16,8 +16,9 @@ def digest(path):
 def runtime(config: BrainCoConfig):
     from .runtime_defaults import EXPERIMENT,DEVICES
     e,d=deepcopy(EXPERIMENT),deepcopy(DEVICES)
-    e['project']['name']='强脑全场景图片脑电采集 · uv'
+    e['project']['name']='强脑全场景图片脑电采集 · 自动续采版 20261115 · uv'
     e['paths']=dict(dataset_root=str(config.output_dir),database=str(config.output_dir/'progress.sqlite'),stimulus_manifest=str(config.assets['manifest']))
+    e['nas_progress_sync']=True
     e['fixed_schedule'].update(path=str(config.assets['schedule']),sha256=config.assets['schedule_sha256'],manifest_sha256=config.assets['manifest_sha256'])
     e['stimulus'].update(image_duration_ms=round(config.duration_s*1000),isi_ms=round(config.protocol['isi_s']*1000))
     e['operator']['default_participant']=config.protocol['participant']

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 import csv
 import hashlib
 import json
@@ -254,40 +254,65 @@ def snapshot_subject(dataset_root, participant, destination):
             if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):raise RuntimeError('Data changed during upload snapshot; stop acquisition first')
 
 
+@contextmanager
+def stopped_database(dataset_root):
+    from PySide6.QtCore import QLockFile
+    lock=QLockFile(str(Path(dataset_root).resolve()/'progress.sqlite')+'.acquisition.lock')
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(0):raise RuntimeError('该数据目录正在准备或执行采集，请结束保存后再上传。')
+    try:yield
+    finally:lock.unlock()
+
+
 def upload_subject(dataset_root,participant,root=ROOT,store=None,progress=print):
     # Same process-independent lease used by acquisition; never race a recording.
     from .acquisition_devices.brainco_native import kit_module
-    local=root/'.local';local.mkdir(exist_ok=True)
-    machine_file=local/'machine-id'
-    if not machine_file.exists():
-        try:
-            with machine_file.open('x') as f:f.write(uuid.uuid4().hex)
-        except FileExistsError:pass
-    machine=machine_file.read_text().strip()
-    if not re.fullmatch('[0-9a-f]{32}',machine):raise ValueError('Invalid local machine ID')
+    from .subject_sync import machine_id
+    machine=machine_id(root)
+    local=root/'.local'
     store=store or store_for(settings(root),assets=False,write=True,root=root)
-    with kit_module('device_lease').DeviceLease(), tempfile.TemporaryDirectory(prefix='upload-',dir=filesystem_path(local)) as tmp:
+    with stopped_database(dataset_root), kit_module('device_lease').DeviceLease(), tempfile.TemporaryDirectory(prefix='upload-',dir=filesystem_path(local)) as tmp:
         staging=Path(tmp); progress('Creating a consistent snapshot of this subject...')
         snapshot_subject(dataset_root,participant,staging)
-        entries=[]
+        from .subject_sync import audit_progress,atomic_json
+        progress('核对已保存的 EEG 标记，生成跨电脑续采检查点…')
+        checkpoint=audit_progress(staging/'progress.sqlite',participant,
+            lambda path:safe_path(staging,'native/'+str(path).replace('\\','/')))
+        checkpoint['progress_sha256']=sha256(staging/'progress.sqlite')
+        atomic_json(staging/'resume/verified-progress-v1.json',checkpoint)
+        entries=[];uploaded_files=0;uploaded_bytes=0;reused_files=0;reused_bytes=0
         prefix='sub-'+participant.removeprefix('sub-')+'/'+machine
         for file in sorted(staging.rglob('*')):
             if not file.is_file():continue
             relative=file.relative_to(staging).as_posix();digest=sha256(file)
             key=prefix+'/objects/'+digest
-            if not store.exists(key) or store.digest(key)!=digest:store.write(key,file)
-            if store.digest(key)!=digest:raise IOError('NAS readback hash mismatch: '+relative)
+            if store.exists(key) and store.digest(key)==digest:
+                reused_files+=1;reused_bytes+=file.stat().st_size
+            else:
+                store.write(key,file)
+                if store.digest(key)!=digest:raise IOError('NAS readback hash mismatch: '+relative)
+                uploaded_files+=1;uploaded_bytes+=file.stat().st_size
             entries.append(dict(path=relative,key=key,sha256=digest,size=file.stat().st_size))
-            progress(f'Uploaded and verified {len(entries)} files')
+            progress(f'已核验 {len(entries)} 个文件；新增/变更上传 {uploaded_files} 个，复用 {reused_files} 个')
         manifest=dict(schema_version=1,participant_id=participant,machine_id=machine,files=entries,
                       quality='backup_only_not_eegqc_approved',hardware_sync_verified=False)
         content=canonical(manifest);snapshot=hashlib.sha256(content).hexdigest()
         manifest_file=staging/'upload-manifest.json';manifest_file.write_bytes(content)
         key=prefix+'/snapshots/'+snapshot+'.json'
-        store.write(key,manifest_file)
+        # Keep immutable snapshots unchanged; latest-upload.json records the
+        # current state even when it matches a previously existing snapshot.
+        if not store.exists(key) or store.digest(key)!=snapshot:store.write(key,manifest_file)
         if store.digest(key)!=snapshot:raise IOError('Manifest readback failed')
         destination = ('s3://'+store.bucket+'/'+store.prefix+key) if isinstance(store,S3Store) else str(store.root/key)
-        result=dict(participant=participant,files=len(entries),bytes=sum(x['size'] for x in entries),snapshot_key=key,destination=destination,verified=True)
+        result=dict(participant=participant,files=len(entries),bytes=sum(x['size'] for x in entries),snapshot_key=key,destination=destination,verified=True,
+                    uploaded_files=uploaded_files,uploaded_bytes=uploaded_bytes,reused_files=reused_files,reused_bytes=reused_bytes)
+        if isinstance(store,SMBStore):
+            from .subject_sync import release_after_upload,atomic_json
+            from datetime import datetime,timezone
+            import socket
+            atomic_json(safe_path(store.root,prefix+'/latest-upload.json'),dict(snapshot_key=key,
+                uploaded_at=datetime.now(timezone.utc).isoformat(),machine_id=machine,hostname=socket.gethostname()))
+            release_after_upload(store,participant,machine)
         reports=root/'reports/transfers';reports.mkdir(parents=True,exist_ok=True)
         (reports/(snapshot+'.json')).write_text(json.dumps(result,indent=2),encoding='utf-8')
         return result

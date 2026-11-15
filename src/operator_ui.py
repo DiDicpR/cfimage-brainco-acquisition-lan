@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt, QThread, QUrl
+from PySide6.QtCore import Qt, QThread, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices, QPainter, QPainterPath, QColor, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
@@ -139,6 +139,13 @@ class OperatorDialog(QDialog):
         self.selection: dict[str, object] = {}
         self.worker = None
         self.busy = False
+        self.catalog_worker = None
+        self._opened = False
+        self._sync_identity = None
+        self._extension_allowed = False
+        self.auto_sync_timer = QTimer(self)
+        self.auto_sync_timer.setSingleShot(True)
+        self.auto_sync_timer.timeout.connect(self.auto_sync_selected)
         self.setObjectName('workbench')
         self.setWindowTitle('场景图片 EEG · 采集工作台' if self.scene_mode else ('THINGS EEG · 双图采集' if self.dual_mode else 'THINGS EEG · 采集工作台'))
         self.setMinimumSize(900, 630)
@@ -394,7 +401,7 @@ class OperatorDialog(QDialog):
         progress_row = QHBoxLayout()
         self.collection_status = label('填写被试编号，读取上次进度；开始前也会自动核对。', 'small', True)
         progress_row.addWidget(self.collection_status, 1)
-        self.resume_button = QPushButton('查看剩余进度')
+        self.resume_button = QPushButton('同步 NAS 并查看剩余进度' if experiment.get('nas_progress_sync') else '查看剩余进度')
         self.resume_button.setObjectName('checkButton')
         self.resume_button.clicked.connect(lambda: self.begin_check(False, progress_only=True))
         progress_row.addWidget(self.resume_button)
@@ -478,15 +485,56 @@ class OperatorDialog(QDialog):
             self.participant.setPlaceholderText('确认本次被试的正式编号')
             self.lock_fixed_controls()
             collection_layout.addWidget(label(
-                '强脑32通道：全部10个场景、平视及俯视；2580张 × 10次。\n'
+                '强脑32通道：全部10个场景、平视及俯视；2580张，默认每张10次。\n'
                 '每 80 张显示加减题 2 秒（无需作答），随后停下等待空格。\n'
                 '按空格后注视十字 0.8 秒，再开始下一轮 80 张；Esc 保存退出。\n'
-                '每张0.6秒、间隔0.1秒；总目标25800次，可分多次续采；短测必须用独立测试编号，不计入正式数据。', 'small', True))
+                '每张0.6秒、间隔0.1秒；完成目标后可提高累计次数，继续采新增轮次。短测使用独立测试编号。', 'small', True))
 
     def lock_fixed_controls(self):
         if self.fixed_schedule:
-            for widget in (self.image_duration, self.target_repeats, self.scene_selector):
+            for widget in (self.image_duration, self.scene_selector):
                 widget.setEnabled(False)
+            self.target_repeats.setEnabled(self._extension_allowed and not self.busy)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._opened and self.experiment.get('nas_progress_sync'):
+            self._opened = True
+            QTimer.singleShot(0, self.sync_catalog)
+
+    def sync_catalog(self):
+        if not self.isVisible():return
+        if self.busy:
+            QTimer.singleShot(600, self.sync_catalog)
+            return
+        from .subject_sync import subject_catalog
+        self.collection_status.setText('正在自动同步 NAS 被试列表；选定编号后自动核对进度…')
+        self.catalog_worker = PreflightWorker(lambda *_: subject_catalog(), '', {}, 0, self)
+        self.catalog_worker.finished.connect(self.catalog_finished)
+        self.catalog_worker.start()
+
+    def catalog_finished(self):
+        worker = self.catalog_worker
+        if worker.error:
+            self.error.setText('NAS 自动同步失败：'+worker.error+'；请恢复网络后重新同步，不能按零进度续采。')
+            self.error.show()
+        else:
+            self.participant_choice.blockSignals(True)
+            known = {self.participant_choice.itemData(i) for i in range(self.participant_choice.count())}
+            for participant in worker.result:
+                if participant not in known:self.participant_choice.addItem(participant, participant)
+            self.participant_choice.blockSignals(False)
+            if not self.busy:self.collection_status.setText('NAS 被试列表已同步。输入或选择编号后自动核对剩余进度。')
+            self.auto_sync_timer.start(600)
+        worker.deleteLater()
+        self.catalog_worker = None
+
+    def auto_sync_selected(self):
+        if not self.isVisible():return
+        if self.busy or self.catalog_worker:
+            self.auto_sync_timer.start(600)
+        elif self.resume_button.isEnabled() and self.participant.text().strip():
+            self.begin_check(False, progress_only=True)
 
     @staticmethod
     def card(title: str = '', number: str = ''):
@@ -505,6 +553,15 @@ class OperatorDialog(QDialog):
 
     def update_identity(self):
         identity = self.participant.text().strip()
+        if self.experiment.get('nas_progress_sync') and identity != self._sync_identity:
+            self._sync_identity = identity
+            self._extension_allowed = False
+            self.target_repeats.blockSignals(True)
+            self.target_repeats.setRange(10, 100)
+            self.target_repeats.setValue(10)
+            self.target_repeats.blockSignals(False)
+            self.lock_fixed_controls()
+            self.auto_sync_timer.start(600)
         valid = bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', identity)) and identity != 'sub-'
         if self.position_mode:
             from .experiment.positions import parse_positions
@@ -559,6 +616,9 @@ class OperatorDialog(QDialog):
         self.reset_collection_status()
 
     def open_progress_query(self):
+        if self.fixed_schedule and self.experiment.get('nas_progress_sync'):
+            self.begin_check(False,progress_only=True)
+            return
         from .progress_ui import ProgressDialog
         experiment = self.selected_experiment()
         experiment['collection'].update(target_repetitions=self.target_repeats.value(),
@@ -569,12 +629,20 @@ class OperatorDialog(QDialog):
 
     def show_collection_summary(self, summary):
         if summary.get('fixed_schedule'):
+            self._extension_allowed = bool(summary.get('extension_allowed'))
+            self.target_repeats.blockSignals(True)
+            self.target_repeats.setMinimum(summary.get('registered_target_repetitions', 10))
+            self.target_repeats.setValue(summary['target_repetitions'])
+            self.target_repeats.blockSignals(False)
+            self.lock_fixed_controls()
             self.collection_status.setText(
                 f"已核验呈现 {summary['total_completed']} / {summary['total_target']} 次（有效 EEG 另计）\n"
                 f"下一原始试次：{summary['next_schedule_trial_id']}；本次 {summary['trial_limit']} 次，"
                 f"纯刺激约 {summary['estimated_minutes']} 分钟。\n"
-                f"未核验记录 {summary.get('unverified_trials', 0)} 次，不跳过；保持原始排程顺序。\n"
-                "点击“预检并继续采集”自动接续剩余试次；每80张展示算式2秒，按空格后等待0.8秒继续。")
+                f"未核验记录 {summary.get('unverified_trials', 0)} 次，不跳过；保持原始排程顺序。\n" +
+                ("当前目标已完成，次数栏已解锁：调高累计次数后继续采集。" if self._extension_allowed else
+                 "当前累计次数锁定；完成目标后自动解锁。") +
+                "\n点击“预检并继续采集”自动接续剩余试次；每80张展示算式2秒，按空格后等待0.8秒继续。")
             return
         if summary.get('strategy') == 'scenes':
             prefix = f"已选 {summary['selected_images']} 张 · 每张累计 {summary['target_repetitions']} 次"
@@ -634,8 +702,12 @@ class OperatorDialog(QDialog):
             self.error.show()
 
     def begin_check(self, launch: bool, progress_only: bool = False):
+        if self.catalog_worker:
+            self.collection_status.setText('正在自动同步 NAS 被试列表，请稍候…')
+            return
         if self.busy or ((launch or progress_only) and not self.resume_button.isEnabled()) or (launch and not self.start_button.isEnabled()):
             return
+        self.auto_sync_timer.stop()
         try:
             experiment = self.selected_experiment()
             from .experiment.config import validate_config
@@ -674,13 +746,17 @@ class OperatorDialog(QDialog):
         participant = self.participant.text().strip()
         def check(mode, devices, code):
             summary = None
+            synced = None
             if self.collection_enabled and (launch or progress_only):
+                if mode=='brainco' and experiment.get('nas_progress_sync'):
+                    from .subject_sync import sync_subject_progress
+                    synced=sync_subject_progress(experiment['paths']['dataset_root'],participant)
                 from .experiment.collection import preview_collection
                 summary = preview_collection(experiment, participant, mode)
                 if launch and not summary['group_remaining']:
                     raise ValueError('所选范围已完成；请选择其他图片序号/分组，或提高累计目标次数。')
             result = {} if progress_only else self.preflight(mode, devices, code)
-            return dict(result, collection=summary)
+            return dict(result, collection=summary, subject_sync=synced, checked_experiment=experiment)
         preflight_devices = deepcopy(self.devices)
         if self.scene_mode:
             ids = self.scene_selector.selected_ids()
@@ -715,6 +791,11 @@ class OperatorDialog(QDialog):
             for widget in (self.paradigm_code, self.concept_input, self.pairing_select, self.fixed_pairs_input):
                 widget.setEnabled(True)
         self.update_identity()
+        if result and result.get('checked_experiment'):
+            self.checked_experiment = result['checked_experiment']
+        if error:
+            self._extension_allowed = False
+            self.lock_fixed_controls()
         if self.progress_only:
             if error:
                 self.collection_status.setText('进度读取失败，请检查图片清单和数据库路径。')
@@ -722,6 +803,9 @@ class OperatorDialog(QDialog):
                 self.error.show()
             elif result.get('collection'):
                 self.show_collection_summary(result['collection'])
+                if result.get('subject_sync'):
+                    sync=result['subject_sync']
+                    self.collection_status.setText(self.collection_status.text()+f"\n已同步 NAS {sync['remote_machines']} 份电脑进度；今天本机 {sync['local_today_sessions']} 段、其他电脑 {sync['remote_today_sessions']} 段。")
             return
         if result and result.get('collection'):
             self.show_collection_summary(result['collection'])
@@ -744,6 +828,12 @@ class OperatorDialog(QDialog):
         self.status_detail.setText('最近检查 ' + datetime.now().strftime('%H:%M:%S') + ' · 启动时会重新预检。' +
             ('\n样本、类别与实物编号已回读。报告：' + result['report_path'] if result.get('report_path') else ''))
         if self.launch_after_check:
+            sync=result.get('subject_sync')
+            if sync and (sync['local_today_sessions'] or sync['remote_today_sessions'] or sync['pending_upload']):
+                answer=QMessageBox.question(self,'该被试已有采集记录',
+                    f"被试 {self.participant.text().strip()}：今天本机已采 {sync['local_today_sessions']} 段，其他电脑已上传 {sync['remote_today_sessions']} 段。\n"
+                    '本次将跳过已完成的固定试次，从剩余位置续采。结束后请上传，再换电脑。是否继续？')
+                if answer!=QMessageBox.StandardButton.Yes:return
             if not hardware:
                 QMessageBox.warning(self, '正在使用软件时间对齐',
                     '本设备仅支持软件对齐，未验证硬件 Trigger 回读。结果将标记为 software_estimated。')
@@ -757,11 +847,11 @@ class OperatorDialog(QDialog):
             self.accept()
 
     def reject(self):
-        if not self.busy:
+        if not self.busy and not self.catalog_worker:
             super().reject()
 
     def closeEvent(self, event):
-        if self.busy:
+        if self.busy or self.catalog_worker:
             event.ignore()
         else:
             super().closeEvent(event)
